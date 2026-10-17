@@ -225,6 +225,9 @@ impl HttpService for reqwest::Client {
         let mut req = reqwest::Request::new(parts.method, url);
         *req.headers_mut() = parts.headers;
         *req.body_mut() = Some(body.into_reqwest());
+        if let Some(observer) = parts.extensions.get::<reqwest::observe::DispatchObserver>() {
+            req.set_dispatch_observer(observer.clone());
+        }
 
         let r = self.execute(req).await.map_err(HttpError::reqwest)?;
         let res: http::Response<reqwest::Body> = r.into();
@@ -316,6 +319,78 @@ impl HttpConnector for ReqwestConnector {
     fn connect(&self, options: &ClientOptions) -> crate::Result<HttpClient> {
         let client = options.client()?;
         Ok(HttpClient::new(client))
+    }
+}
+
+#[cfg(all(test, feature = "reqwest", not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::client::mock_server::MockServer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn reqwest_service_keeps_dispatch_observer_through_redirect() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let server = MockServer::new().await;
+            let requests = Arc::new(AtomicUsize::new(0));
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let client = ReqwestConnector::default()
+                .connect(&ClientOptions::new().with_allow_http(true))
+                .unwrap();
+
+            for enabled in [false, true] {
+                for path in ["/start", "/destination"] {
+                    let witnessed = requests.clone();
+                    server.push_async_fn(move |request| async move {
+                        witnessed.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(request.method(), Method::POST);
+                        assert_eq!(request.uri().path(), path);
+                        assert_eq!(request.version(), http::Version::HTTP_11);
+                        assert_eq!(request.headers()["x-request"], "value");
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        assert_eq!(body.as_ref(), b"payload");
+                        if path == "/start" {
+                            http::Response::builder()
+                                .status(307)
+                                .header("location", "/destination")
+                                .body(String::new())
+                                .unwrap()
+                        } else {
+                            http::Response::new("abc".to_string())
+                        }
+                    });
+                }
+                let mut request = http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{}/start", server.url()))
+                    .version(http::Version::HTTP_10)
+                    .header("x-request", "value")
+                    .body("payload".to_string().into())
+                    .unwrap();
+                if enabled {
+                    let observed = dispatches.clone();
+                    request
+                        .extensions_mut()
+                        .insert(reqwest::observe::DispatchObserver::new(move |event| {
+                            assert_eq!(event.method(), Method::POST);
+                            assert_eq!(event.version(), http::Version::HTTP_11);
+                            observed.fetch_add(1, Ordering::Relaxed);
+                        }));
+                }
+                let response = client.execute(request).await.unwrap();
+                assert_eq!(response.status(), http::StatusCode::OK);
+                assert_eq!(response.into_body().bytes().await.unwrap().as_ref(), b"abc");
+                assert_eq!(
+                    dispatches.load(Ordering::Relaxed),
+                    if enabled { 2 } else { 0 },
+                    "only the observed call must retain both dispatches"
+                );
+            }
+            assert_eq!(requests.load(Ordering::Relaxed), 4);
+            server.shutdown().await;
+        })
+        .await
+        .unwrap();
     }
 }
 
