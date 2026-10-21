@@ -17,6 +17,8 @@
 
 use super::*;
 use crate::ClientOptions;
+#[cfg(feature = "gcp-base")]
+use crate::ObjectStoreExt;
 use crate::client::ReadStage;
 use crate::client::mock_server::MockServer;
 use crate::client::{
@@ -385,7 +387,6 @@ fn data_response() -> http::Response<String> {
 #[cfg(feature = "gcp-base")]
 #[tokio::test]
 async fn gcs_requests_follow_their_local_credential_completion() {
-    use crate::ObjectStore;
     tokio::time::timeout(Duration::from_secs(10), async {
         let server = MockServer::new().await;
         let arrived = Arc::new(Notify::new());
@@ -466,7 +467,6 @@ async fn gcs_requests_follow_their_local_credential_completion() {
 #[cfg(feature = "gcp-base")]
 #[tokio::test]
 async fn gcs_data_stage_stays_open_until_body_terminal_or_drop() {
-    use crate::ObjectStore;
     use futures_util::StreamExt;
     for outcome in 0..3 {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -566,7 +566,6 @@ impl crate::CredentialProvider for UnsupportedCredential {
 #[cfg(feature = "gcp-base")]
 #[tokio::test]
 async fn unsupported_credentials_remain_distinct_from_static_ready_values() {
-    use crate::ObjectStore;
     for ready in [false, true] {
         tokio::time::timeout(Duration::from_secs(10), async {
             let server = MockServer::new().await;
@@ -691,8 +690,9 @@ async fn refresh_after_a_blocked_wait_starts_after_the_local_waiter() {
                 .await
         });
         arrived.notified().await;
+        let second_url = server.url().to_string();
         let second = cache
-            .get_or_insert_with_client(Some(&client), || fetch(&client, server.url(), &observed));
+            .get_or_insert_with_client(Some(&client), || fetch(&client, &second_url, &observed));
         futures_util::pin_mut!(second);
         assert!(futures_util::poll!(&mut second).is_pending());
         release.notify_one();
