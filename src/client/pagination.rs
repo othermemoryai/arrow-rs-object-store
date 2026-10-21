@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::trace::ReadScope;
 use crate::Result;
 use futures_util::Stream;
 use std::future::Future;
+use tracing::{Instrument, Span};
 
 /// Takes a paginated operation `op` that when called with:
 ///
@@ -47,30 +49,39 @@ where
 {
     enum PaginationState<T> {
         Start(T),
-        HasMore(T, String),
+        HasMore(T, String, Span),
         Done,
     }
 
     futures_util::stream::unfold(PaginationState::Start(state), move |state| {
         let client = client.clone();
         async move {
-            let (s, page_token) = match state {
-                PaginationState::Start(s) => (s, None),
-                PaginationState::HasMore(s, page_token) if !page_token.is_empty() => {
-                    (s, Some(page_token))
+            let (s, page_token, previous) = match state {
+                PaginationState::Start(s) => (s, None, None),
+                PaginationState::HasMore(s, page_token, previous) if !page_token.is_empty() => {
+                    (s, Some(page_token), Some(previous))
                 }
                 _ => {
                     return None;
                 }
             };
 
-            let (resp, s, continuation) = match op(client, s, page_token).await {
+            let page = ReadScope::new(tracing::info_span!("object_store.list.page"));
+            if let Some(previous) = previous {
+                page.span().follows_from(&previous);
+            }
+            let result = op(client, s, page_token)
+                .instrument(page.span().clone())
+                .await;
+            let completed = page.span().clone();
+            drop(page);
+            let (resp, s, continuation) = match result {
                 Ok(resp) => resp,
                 Err(e) => return Some((Err(e), PaginationState::Done)),
             };
 
             let next_state = match continuation {
-                Some(token) => PaginationState::HasMore(s, token),
+                Some(token) => PaginationState::HasMore(s, token, completed),
                 None => PaginationState::Done,
             };
 

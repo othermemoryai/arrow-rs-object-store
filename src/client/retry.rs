@@ -20,6 +20,7 @@
 use crate::PutPayload;
 use crate::client::backoff::{Backoff, BackoffConfig};
 use crate::client::builder::HttpRequestBuilder;
+use crate::client::trace::ReadScope;
 use crate::client::{HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpResponse};
 use futures_util::future::BoxFuture;
 use http::StatusCode;
@@ -352,7 +353,8 @@ impl RetryableRequest {
                 *request.body_mut() = payload.clone().into();
             }
 
-            let attempt = tracing::info_span!("object_store.http.attempt");
+            let scope = ReadScope::new(tracing::info_span!("object_store.http.attempt"));
+            let attempt = scope.span().clone();
             if let Some(previous) = previous.take() {
                 attempt.follows_from(&previous);
             }
@@ -362,6 +364,7 @@ impl RetryableRequest {
                 .instrument(attempt.clone())
                 .await;
             previous = Some(attempt);
+            let result = result.map(|response| scope.response(response));
             match result {
                 Ok(r) => {
                     let status = r.status();

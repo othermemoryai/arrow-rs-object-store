@@ -31,6 +31,7 @@ pub use dns::{DnsError, DnsFuture, DnsResolver};
 pub(crate) mod mock_server;
 
 pub(crate) mod retry;
+mod trace;
 
 #[cfg(any(feature = "aws-base", feature = "gcp-base", feature = "azure-base"))]
 pub(crate) mod pagination;
