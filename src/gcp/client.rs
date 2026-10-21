@@ -77,6 +77,9 @@ enum Error {
         path: String,
     },
 
+    #[error("Error getting head response body: {}", source)]
+    HeadResponseBody { source: HttpError },
+
     #[error("Error performing request {}: {}", path, source)]
     Request {
         source: crate::client::retry::RetryError,
@@ -652,7 +655,8 @@ impl GetClient for GoogleCloudStorageClient {
         let stage = ReadStageScope::after(&self.client, completion);
         let url = self.object_url(path);
 
-        let method = match options.head {
+        let head = options.head;
+        let method = match head {
             true => Method::HEAD,
             false => Method::GET,
         };
@@ -678,6 +682,15 @@ impl GetClient for GoogleCloudStorageClient {
             })
             .await?;
 
+        if head {
+            let (parts, body) = response.into_parts();
+            let body = stage
+                .run(body.bytes())
+                .await
+                .map_err(|source| Error::HeadResponseBody { source })?;
+            stage.finish(true);
+            return Ok(HttpResponse::from_parts(parts, body.into()));
+        }
         Ok(stage.response(response))
     }
 }

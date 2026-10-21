@@ -663,6 +663,7 @@ async fn gcs_head_and_list_forward_the_credential_completion() {
 async fn refresh_after_a_blocked_wait_starts_after_the_local_waiter() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let server = MockServer::new().await;
+        let expired = Instant::now() - Duration::from_secs(3600);
         let arrived = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let entered = arrived.clone();
@@ -684,7 +685,7 @@ async fn refresh_after_a_blocked_wait_starts_after_the_local_waiter() {
             producer_cache
                 .get_or_insert_with_client(Some(&producer_client), || async {
                     let mut token = fetch(&producer_client, &url, &producer_observed).await?;
-                    token.expiry = Some(Instant::now());
+                    token.expiry = Some(expired);
                     Ok::<_, String>(token)
                 })
                 .await
