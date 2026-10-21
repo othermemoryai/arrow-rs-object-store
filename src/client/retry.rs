@@ -27,7 +27,7 @@ use http::header::LOCATION;
 use http::{Method, Uri};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{Instrument, Span, info};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{Duration, Instant};
 
@@ -344,6 +344,7 @@ impl RetryableRequest {
     }
 
     pub(crate) async fn send(self, ctx: &mut RetryContext) -> Result<HttpResponse> {
+        let mut previous: Option<Span> = None;
         loop {
             let mut request = self.http.clone();
 
@@ -351,7 +352,17 @@ impl RetryableRequest {
                 *request.body_mut() = payload.clone().into();
             }
 
-            match self.client.execute(request).await {
+            let attempt = tracing::info_span!("object_store.http.attempt");
+            if let Some(previous) = previous.take() {
+                attempt.follows_from(&previous);
+            }
+            let result = self
+                .client
+                .execute(request)
+                .instrument(attempt.clone())
+                .await;
+            previous = Some(attempt);
+            match result {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
