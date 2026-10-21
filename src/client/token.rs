@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::trace::ReadStageScope;
+use super::{CredentialRead, HttpClient, ReadStageCompletion};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -42,6 +45,7 @@ pub(crate) struct TokenCache<T> {
 struct CacheEntry<T> {
     token: TemporaryToken<T>,
     fetched_at: Instant,
+    completion: Option<Arc<dyn ReadStageCompletion>>,
 }
 
 impl<T> Default for TokenCache<T> {
@@ -68,6 +72,20 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send,
     {
+        self.get_or_insert_with_client(None, f)
+            .await
+            .map(|value| value.0)
+    }
+
+    pub(crate) async fn get_or_insert_with_client<F, Fut, E>(
+        &self,
+        client: Option<&HttpClient>,
+        f: F,
+    ) -> Result<(T, CredentialRead), E>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<TemporaryToken<T>, E>> + Send,
+    {
         let now = Instant::now();
         let is_token_valid = |entry: &CacheEntry<T>| {
             entry.token.expiry.is_none_or(|ttl| {
@@ -78,28 +96,77 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
             })
         };
 
-        if let Some(cache) = self.cache.read().await.as_ref() {
-            if is_token_valid(cache) {
-                return Ok(cache.token.token.clone());
+        let mut stage = None;
+        let guard = match self.cache.try_read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let active = ReadStageScope::new(client, Vec::new());
+                let guard = active.run(self.cache.read()).await;
+                stage = Some(active);
+                guard
             }
-        }
-
-        let mut guard = self.cache.write().await;
+        };
         if let Some(cache) = guard.as_ref() {
             if is_token_valid(cache) {
-                // Refresh race
-                return Ok(cache.token.token.clone());
+                let completion = match stage {
+                    Some(stage) => {
+                        stage.join(cache.completion.clone());
+                        stage
+                            .finish(true)
+                            .map_or(CredentialRead::Unavailable, CredentialRead::Completed)
+                    }
+                    None => CredentialRead::Ready,
+                };
+                return Ok((cache.token.token.clone(), completion));
+            }
+        }
+        drop(guard);
+
+        let mut guard = match self.cache.try_write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let active = stage.get_or_insert_with(|| ReadStageScope::new(client, Vec::new()));
+                active.run(self.cache.write()).await
+            }
+        };
+        if let Some(cache) = guard.as_ref() {
+            if is_token_valid(cache) {
+                let completion = match stage {
+                    Some(stage) => {
+                        stage.join(cache.completion.clone());
+                        stage
+                            .finish(true)
+                            .map_or(CredentialRead::Unavailable, CredentialRead::Completed)
+                    }
+                    None => CredentialRead::Ready,
+                };
+                return Ok((cache.token.token.clone(), completion));
             }
         }
 
-        let cached = f().await?;
+        let predecessors = if let Some(stage) = stage {
+            stage.join(guard.as_ref().and_then(|entry| entry.completion.clone()));
+            stage.finish(true).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let stage = ReadStageScope::new(client, predecessors);
+        if let Some(entry) = guard.as_mut() {
+            entry.completion = None;
+        }
+        let cached = stage.run(f()).await?;
         let token = cached.token.clone();
+        let completion = stage.finish(true);
         *guard = Some(CacheEntry {
             token: cached,
             fetched_at: Instant::now(),
+            completion: completion.clone(),
         });
 
-        Ok(token)
+        Ok((
+            token,
+            completion.map_or(CredentialRead::Unavailable, CredentialRead::Completed),
+        ))
     }
 }
 
@@ -168,3 +235,7 @@ mod test {
         assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
     }
 }
+
+#[cfg(all(test, feature = "reqwest", not(target_arch = "wasm32")))]
+#[path = "token_stage_test.rs"]
+mod stage_test;

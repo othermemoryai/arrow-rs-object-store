@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use http::{Method, Uri};
 #[cfg(feature = "reqwest")]
 use http_body_util::BodyExt;
+use std::any::Any;
 use std::error::Error;
 use std::sync::Arc;
 #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
@@ -146,9 +147,30 @@ impl HttpError {
     }
 }
 
+/// A completed read stage carries no live tracing span.
+pub trait ReadStageCompletion: Any + std::fmt::Debug + Send + Sync {}
+
+/// A source stage belongs to the current issued read.
+pub trait ReadStage: std::fmt::Debug + Send + Sync {
+    /// Returns the stage's read context span.
+    fn span(&self) -> tracing::Span;
+    /// Joins an observed producer completion, including a missing completion.
+    fn join(&self, predecessor: Option<Arc<dyn ReadStageCompletion>>) -> bool;
+    /// Closes the actual work and returns its completed source token.
+    fn finish(&self, succeeded: bool) -> Option<Arc<dyn ReadStageCompletion>>;
+}
+
 /// An asynchronous function from a [`HttpRequest`] to a [`HttpResponse`].
 #[async_trait]
 pub trait HttpService: std::fmt::Debug + Send + Sync + 'static {
+    /// Begins a source stage when the current issued read supports one.
+    fn begin_read_stage(
+        &self,
+        _predecessors: Vec<Arc<dyn ReadStageCompletion>>,
+    ) -> Option<Arc<dyn ReadStage>> {
+        None
+    }
+
     /// Perform [`HttpRequest`] returning [`HttpResponse`]
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError>;
 }
@@ -166,6 +188,13 @@ impl HttpClient {
     /// Performs [`HttpRequest`] using this client
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
         self.0.call(request).await
+    }
+
+    pub(crate) fn begin_read_stage(
+        &self,
+        predecessors: Vec<Arc<dyn ReadStageCompletion>>,
+    ) -> Option<Arc<dyn ReadStage>> {
+        self.0.begin_read_stage(predecessors)
     }
 
     #[allow(unused)]

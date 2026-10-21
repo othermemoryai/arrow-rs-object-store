@@ -19,8 +19,9 @@ use super::client::GoogleCloudStorageClient;
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::retry::RetryExt;
 use crate::client::token::TemporaryToken;
+use crate::client::trace::ReadStageScope;
 use crate::client::{
-    CryptoProvider, HttpClient, HttpError, Signer, SigningAlgorithm, TokenProvider,
+    CredentialRead, CryptoProvider, HttpClient, HttpError, Signer, SigningAlgorithm, TokenProvider,
 };
 use crate::gcp::{GcpSigningCredentialProvider, STORE};
 use crate::util::{STRICT_ENCODE_SET, append_strict_query_pairs, hex_digest, hex_encode};
@@ -448,7 +449,14 @@ impl TokenProvider for InstanceCredentialProvider {
 
         info!("fetching token from metadata server");
         let response = make_metadata_request(client, &metadata_host, retry)
-            .or_else(|_| make_metadata_request(client, &metadata_ip, retry))
+            .or_else(|_| async {
+                let stage = ReadStageScope::after(client, CredentialRead::Unavailable);
+                let response = stage
+                    .run(make_metadata_request(client, &metadata_ip, retry))
+                    .await;
+                stage.finish(response.is_ok());
+                response
+            })
             .await?;
 
         let token = TemporaryToken {
@@ -520,7 +528,14 @@ impl TokenProvider for InstanceSigningCredentialProvider {
         info!("fetching token from metadata server");
 
         let email = make_metadata_request_for_email(client, &metadata_host, retry)
-            .or_else(|_| make_metadata_request_for_email(client, &metadata_ip, retry))
+            .or_else(|_| async {
+                let stage = ReadStageScope::after(client, CredentialRead::Unavailable);
+                let response = stage
+                    .run(make_metadata_request_for_email(client, &metadata_ip, retry))
+                    .await;
+                stage.finish(response.is_ok());
+                response
+            })
             .await?;
 
         let token = TemporaryToken {

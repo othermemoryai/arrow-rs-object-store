@@ -24,7 +24,10 @@ use crate::client::s3::{
     CompleteMultipartUpload, CompleteMultipartUploadResult, InitiateMultipartUploadResult,
     ListResponse,
 };
-use crate::client::{CryptoProvider, GetOptionsExt, HttpClient, HttpError, HttpResponse};
+use crate::client::trace::ReadStageScope;
+use crate::client::{
+    CredentialRead, CryptoProvider, GetOptionsExt, HttpClient, HttpError, HttpResponse,
+};
 use crate::gcp::credential::CredentialExt;
 use crate::gcp::{GcpCredential, GcpCredentialProvider, GcpSigningCredentialProvider, STORE};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
@@ -163,6 +166,16 @@ impl GoogleCloudStorageConfig {
             false => Some(self.credentials.get_credential().await?),
             true => None,
         })
+    }
+
+    async fn get_credential_with_completion(
+        &self,
+    ) -> Result<(Option<Arc<GcpCredential>>, CredentialRead)> {
+        if self.skip_signature {
+            return Ok((None, CredentialRead::Ready));
+        }
+        let (credential, completion) = self.credentials.get_credential_with_completion().await?;
+        Ok((Some(credential), completion))
     }
 }
 
@@ -635,7 +648,8 @@ impl GetClient for GoogleCloudStorageClient {
         path: &Path,
         options: GetOptions,
     ) -> Result<HttpResponse> {
-        let credential = self.get_credential().await?;
+        let (credential, completion) = self.config.get_credential_with_completion().await?;
+        let stage = ReadStageScope::after(&self.client, completion);
         let url = self.object_url(path);
 
         let method = match options.head {
@@ -649,18 +663,22 @@ impl GetClient for GoogleCloudStorageClient {
             request = request.query(&[("generation", version)]);
         }
 
-        let response = request
-            .with_bearer_auth(credential.as_deref())
-            .with_get_options(options)
-            .retryable_request()
-            .send(ctx)
-            .await
-            .map_err(|source| {
-                let path = path.as_ref().into();
-                Error::GetRequest { source, path }
-            })?;
+        let response = stage
+            .run(async {
+                request
+                    .with_bearer_auth(credential.as_deref())
+                    .with_get_options(options)
+                    .retryable_request()
+                    .send(ctx)
+                    .await
+                    .map_err(|source| {
+                        let path = path.as_ref().into();
+                        Error::GetRequest { source, path }
+                    })
+            })
+            .await?;
 
-        Ok(response)
+        Ok(stage.response(response))
     }
 }
 
@@ -672,7 +690,8 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
         prefix: Option<&str>,
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
-        let credential = self.get_credential().await?;
+        let (credential, completion) = self.config.get_credential_with_completion().await?;
+        let stage = ReadStageScope::after(&self.client, completion);
         let url = format!("{}/{}", self.config.base_url, self.bucket_name_encoded);
 
         let mut query = Vec::with_capacity(5);
@@ -703,34 +722,40 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
             query.push(("max-keys", max_keys_str.as_ref()))
         }
 
-        let response = self
-            .client
-            .request(Method::GET, url)
-            .extensions(opts.extensions)
-            .query(&query)
-            .with_bearer_auth(credential.as_deref())
-            .send_retry(&self.config.retry_config)
-            .await
-            .map_err(|source| Error::ListRequest { source })?;
+        let result = stage
+            .run(async {
+                let response = self
+                    .client
+                    .request(Method::GET, url)
+                    .extensions(opts.extensions)
+                    .query(&query)
+                    .with_bearer_auth(credential.as_deref())
+                    .send_retry(&self.config.retry_config)
+                    .await
+                    .map_err(|source| Error::ListRequest { source })?;
 
-        let (parts, body) = response.into_parts();
+                let (parts, body) = response.into_parts();
 
-        let response = body
-            .bytes()
-            .await
-            .map_err(|source| Error::ListResponseBody { source })?;
+                let response = body
+                    .bytes()
+                    .await
+                    .map_err(|source| Error::ListResponseBody { source })?;
 
-        let mut response: ListResponse = quick_xml::de::from_reader(response.reader())
-            .map_err(|source| Error::InvalidListResponse { source })?;
+                let mut response: ListResponse = quick_xml::de::from_reader(response.reader())
+                    .map_err(|source| Error::InvalidListResponse { source })?;
 
-        let token = response.next_continuation_token.take();
+                let token = response.next_continuation_token.take();
 
-        let mut result: ListResult = response.try_into()?;
-        result.extensions = parts.extensions;
+                let mut result: ListResult = response.try_into()?;
+                result.extensions = parts.extensions;
 
-        Ok(PaginatedListResult {
-            result,
-            page_token: token,
-        })
+                Ok(PaginatedListResult {
+                    result,
+                    page_token: token,
+                })
+            })
+            .await;
+        stage.finish(result.is_ok());
+        result
     }
 }

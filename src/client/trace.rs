@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{HttpError, HttpResponse, HttpResponseBody};
+use super::{
+    CredentialRead, HttpClient, HttpError, HttpResponse, HttpResponseBody, ReadStage,
+    ReadStageCompletion,
+};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use tracing::Span;
+use tracing::{Instrument, Span};
 
 pub(super) struct ReadScope {
     parent: Span,
@@ -47,6 +52,7 @@ impl ReadScope {
             HttpResponseBody::new(ScopedBody {
                 inner: body,
                 scope: Some(self),
+                stage: None,
             })
         };
         HttpResponse::from_parts(parts, body)
@@ -82,9 +88,76 @@ fn dependency(
     });
 }
 
+pub(crate) struct ReadStageScope(Option<Arc<dyn ReadStage>>);
+
+impl ReadStageScope {
+    pub(crate) fn new(
+        client: Option<&HttpClient>,
+        predecessors: Vec<Arc<dyn ReadStageCompletion>>,
+    ) -> Self {
+        Self(client.and_then(|client| client.begin_read_stage(predecessors)))
+    }
+
+    pub(crate) fn after(client: &HttpClient, predecessor: CredentialRead) -> Self {
+        match predecessor {
+            CredentialRead::Completed(predecessor) => Self::new(Some(client), vec![predecessor]),
+            CredentialRead::Ready => Self(None),
+            CredentialRead::Unavailable => {
+                let stage = Self::new(Some(client), Vec::new());
+                stage.join(None);
+                stage
+            }
+        }
+    }
+
+    pub(crate) async fn run<F: Future>(&self, future: F) -> F::Output {
+        match &self.0 {
+            Some(stage) => future.instrument(stage.span()).await,
+            None => future.await,
+        }
+    }
+
+    pub(crate) fn join(&self, completion: Option<Arc<dyn ReadStageCompletion>>) {
+        if let Some(stage) = &self.0 {
+            stage.join(completion);
+        }
+    }
+
+    pub(crate) fn finish(mut self, succeeded: bool) -> Option<Arc<dyn ReadStageCompletion>> {
+        self.0.take().and_then(|stage| stage.finish(succeeded))
+    }
+
+    pub(crate) fn response(self, response: HttpResponse) -> HttpResponse {
+        if self.0.is_none() {
+            return response;
+        }
+        let (parts, body) = response.into_parts();
+        let body = if body.is_end_stream() {
+            self.finish(true);
+            body
+        } else {
+            HttpResponseBody::new(ScopedBody {
+                inner: body,
+                scope: None,
+                stage: Some(self),
+            })
+        };
+        HttpResponse::from_parts(parts, body)
+    }
+}
+
+impl Drop for ReadStageScope {
+    fn drop(&mut self) {
+        if let Some(stage) = self.0.take() {
+            stage.finish(false);
+        }
+    }
+}
+
 struct ScopedBody {
     inner: HttpResponseBody,
     scope: Option<ReadScope>,
+    stage: Option<ReadStageScope>,
 }
 
 impl Body for ScopedBody {
@@ -100,6 +173,9 @@ impl Body for ScopedBody {
             || self.inner.is_end_stream()
         {
             drop(self.scope.take());
+            if let Some(stage) = self.stage.take() {
+                stage.finish(!matches!(&frame, Poll::Ready(Some(Err(_)))));
+            }
         }
         frame
     }

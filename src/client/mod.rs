@@ -31,7 +31,7 @@ pub use dns::{DnsError, DnsFuture, DnsResolver};
 pub(crate) mod mock_server;
 
 pub(crate) mod retry;
-mod trace;
+pub(crate) mod trace;
 
 #[cfg(any(feature = "aws-base", feature = "gcp-base", feature = "azure-base"))]
 pub(crate) mod pagination;
@@ -1039,6 +1039,17 @@ impl GetOptionsExt for HttpRequestBuilder {
     }
 }
 
+/// A credential is ready, follows completed work, or has unavailable causal coverage.
+#[derive(Debug, Clone)]
+pub enum CredentialRead {
+    /// No producer or lock wait ran for this credential.
+    Ready,
+    /// The caller's credential work settled with this immutable token.
+    Completed(Arc<dyn ReadStageCompletion>),
+    /// The credential succeeded without a usable causal completion.
+    Unavailable,
+}
+
 /// Provides credentials for use when signing requests
 #[async_trait]
 pub trait CredentialProvider: std::fmt::Debug + Send + Sync {
@@ -1047,6 +1058,13 @@ pub trait CredentialProvider: std::fmt::Debug + Send + Sync {
 
     /// Return a credential
     async fn get_credential(&self) -> Result<Arc<Self::Credential>>;
+
+    /// Returns a credential and any completed work awaited to obtain it.
+    async fn get_credential_with_completion(
+        &self,
+    ) -> Result<(Arc<Self::Credential>, CredentialRead)> {
+        Ok((self.get_credential().await?, CredentialRead::Unavailable))
+    }
 }
 
 /// A static set of credentials
@@ -1073,6 +1091,10 @@ where
 
     async fn get_credential(&self) -> Result<Arc<T>> {
         Ok(Arc::clone(&self.credential))
+    }
+
+    async fn get_credential_with_completion(&self) -> Result<(Arc<T>, CredentialRead)> {
+        Ok((Arc::clone(&self.credential), CredentialRead::Ready))
     }
 }
 
@@ -1116,6 +1138,16 @@ mod cloud {
         async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
             self.cache
                 .get_or_insert_with(|| self.inner.fetch_token(&self.client, &self.retry))
+                .await
+        }
+
+        async fn get_credential_with_completion(
+            &self,
+        ) -> Result<(Arc<Self::Credential>, CredentialRead)> {
+            self.cache
+                .get_or_insert_with_client(Some(&self.client), || {
+                    self.inner.fetch_token(&self.client, &self.retry)
+                })
                 .await
         }
     }
